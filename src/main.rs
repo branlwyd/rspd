@@ -18,9 +18,10 @@ use std::net;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::thread;
+use std::time;
 use tee::TeeReader;
 
-// TODO: read/write timeouts
+// TODO: use async/await with e.g. Tokio once it is stabilized
 // TODO: don't ignore errors other than ENOTCONN (OS error 107) when closing sockets?
 
 fn main() {
@@ -73,13 +74,13 @@ struct Config {
 }
 
 fn handle_connection(cfg: &Config, client_stream: TcpStream) -> io::Result<()> {
-    let client_stream = Arc::new(client_stream);
     let client_addr = client_stream.peer_addr()?.ip();
+    client_stream.set_read_timeout(Some(time::Duration::from_secs(5)))?;
     
     // Read SNI hostname.
     let mut read_buf = Vec::new();
     let sni_host_name = {
-        let mut reader = HandshakeRecordReader::new(BufReader::new(TeeReader::new(client_stream.deref(), &mut read_buf)));
+        let mut reader = HandshakeRecordReader::new(BufReader::new(TeeReader::new(&client_stream, &mut read_buf)));
         read_sni_host_name_from_handshake_message(&mut reader)?
     };
 
@@ -92,6 +93,8 @@ fn handle_connection(cfg: &Config, client_stream: TcpStream) -> io::Result<()> {
     let server_stream = Arc::new(TcpStream::connect(format!("{}:443", server_host))?);
 
     // Copy data between client & server.
+    client_stream.set_read_timeout(None)?; // at this point, trust the timeouts of the server
+    let client_stream = Arc::new(client_stream);
     let client_to_server_handle = {
         let (client_stream, server_stream) = (Arc::clone(&client_stream), Arc::clone(&server_stream));
         thread::spawn(move || {
