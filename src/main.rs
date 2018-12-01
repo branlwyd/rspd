@@ -109,22 +109,18 @@ fn handle_connection(cfg: &Config, client_stream: TcpStream) -> io::Result<()> {
             })
         })
     };
-    let server_to_client_handle = {
-        let (client_stream, server_stream) = (Arc::clone(&client_stream), Arc::clone(&server_stream));
-        thread::spawn(move || {
-            io::copy(&mut server_stream.deref(), &mut client_stream.deref())?;
-            // server_stream must be at EOF now. Ignore NotConnected errors on close.
-            client_stream.shutdown(net::Shutdown::Write).or_else(|err| {
-                match err.kind() {
-                    io::ErrorKind::NotConnected => Ok(()),
-                    _ => Err(err),
-                }
-            })
+    let server_to_client_rslt = (move || {
+        io::copy(&mut server_stream.deref(), &mut client_stream.deref())?;
+        // server_stream must be at EOF now. Ignore NotConnected errors on close.
+        client_stream.shutdown(net::Shutdown::Write).or_else(|err| {
+            match err.kind() {
+                io::ErrorKind::NotConnected => Ok(()),
+                _ => Err(err),
+            }
         })
-    };
+    })();
 
     let client_to_server_rslt = client_to_server_handle.join().unwrap();
-    let server_to_client_rslt = server_to_client_handle.join().unwrap();
     client_to_server_rslt.and(server_to_client_rslt)
 }
 
