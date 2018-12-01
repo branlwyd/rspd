@@ -121,23 +121,19 @@ fn handle_connection(cfg: &Config, client_stream: TcpStream) -> io::Result<()> {
     client_to_server_rslt.and(server_to_client_rslt)
 }
 
-struct HandshakeRecordReader<R: Read> {
-    internal: Option<InternalHandshakeRecordReader<R>>,
-}
+struct HandshakeRecordReader<R: Read>(Option<InternalHandshakeRecordReader<R>>);
 
 impl<R: Read> HandshakeRecordReader<R> {
     fn new(reader: R) -> HandshakeRecordReader<R> {
-        HandshakeRecordReader {
-            internal: Some(InternalHandshakeRecordReader::new(reader)),
-        }
+        HandshakeRecordReader(Some(InternalHandshakeRecordReader::new(reader)))
     }
 }
 
 impl<R: Read> Read for HandshakeRecordReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let rslt = self.internal.as_mut().expect("Read from already-errored HandshakeRecordReader").read(buf);
+        let rslt = self.0.as_mut().expect("Read from already-errored HandshakeRecordReader").read(buf);
         if rslt.is_err() {
-            self.internal = None
+            self.0 = None
         }
         rslt
     }
