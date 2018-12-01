@@ -22,7 +22,6 @@ use std::time;
 use tee::TeeReader;
 
 // TODO: use async/await with e.g. Tokio once it is stabilized
-// TODO: don't ignore errors other than ENOTCONN (OS error 107) when closing sockets?
 
 fn main() {
     // Initialize, parse & verify flags.
@@ -101,18 +100,26 @@ fn handle_connection(cfg: &Config, client_stream: TcpStream) -> io::Result<()> {
             //server_stream.deref().write_all(&read_buf)?;
             //io::copy(&mut client_stream.deref(), &mut server_stream.deref())?;
             io::copy(&mut read_buf.chain(client_stream.deref()), &mut server_stream.deref())?;
-            // client_stream must be at EOF now.
-            let _ = server_stream.shutdown(net::Shutdown::Write); // ignore error on close
-            Ok(())
+            // client_stream must be at EOF now. Ignore NotConnected errors on close.
+            server_stream.shutdown(net::Shutdown::Write).or_else(|err| {
+                match err.kind() {
+                    io::ErrorKind::NotConnected => Ok(()),
+                    _ => Err(err),
+                }
+            })
         })
     };
     let server_to_client_handle = {
         let (client_stream, server_stream) = (Arc::clone(&client_stream), Arc::clone(&server_stream));
         thread::spawn(move || {
             io::copy(&mut server_stream.deref(), &mut client_stream.deref())?;
-            // server_stream must be at EOF now.
-            let _ = client_stream.shutdown(net::Shutdown::Write); // ignore error on close
-            Ok(())
+            // server_stream must be at EOF now. Ignore NotConnected errors on close.
+            client_stream.shutdown(net::Shutdown::Write).or_else(|err| {
+                match err.kind() {
+                    io::ErrorKind::NotConnected => Ok(()),
+                    _ => Err(err),
+                }
+            })
         })
     };
 
