@@ -1,70 +1,94 @@
+extern crate async_std;
 extern crate byteorder;
 extern crate clap;
-#[macro_use] extern crate log;
+#[macro_use]
+extern crate log;
+#[macro_use]
+extern crate pin_project;
+#[macro_use]
+extern crate pin_utils;
 extern crate serde;
-#[macro_use] extern crate serde_derive;
+#[macro_use]
+extern crate serde_derive;
 extern crate serde_yaml;
 extern crate simple_logger;
-extern crate tee; // TODO: switch to io::Read.tee once it is stabilized
 
-use byteorder::{NetworkEndian, ReadBytesExt};
+use async_std::prelude::*;
+
+use async_std::io;
+use async_std::io::{Error, Read};
+use async_std::net::{TcpListener, TcpStream};
+use async_std::task;
+use byteorder::{ByteOrder, NetworkEndian};
+use log::Level;
 use std::cmp::min;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufReader, Read};
-use std::io;
-use std::net::{TcpListener, TcpStream};
 use std::net;
 use std::ops::Deref;
+use std::pin::Pin;
 use std::sync::Arc;
-use std::thread;
-use std::time;
-use tee::TeeReader;
+use std::task::{Context, Poll};
+use std::time::Duration;
 
-// TODO: use async/await with e.g. Tokio once it is stabilized
+// TODO: re-implement HandshakeRecordReader in a saner way and nuke the existing implementation from orbit
+// TODO: implement read_u{8,16,24} as an extension trait on Read once async traits functions are supported
 
 fn main() {
     // Initialize, parse & verify flags.
-    simple_logger::init().expect("Could not initialize logging");
+    simple_logger::init_with_level(Level::Info).expect("Couldn't initialize logging");
     let flags = clap::App::new("rspd")
         .version("0.1")
         .author("Brandon Pitman <brandon.pitman@gmail.com>")
         .about("Simple SNI-based HTTPS proxy.")
-        .arg(clap::Arg::with_name("config")
-             .long("config")
-             .value_name("FILE")
-             .help("The config file to use")
-             .required(true)
-             .takes_value(true))
+        .arg(
+            clap::Arg::with_name("config")
+                .long("config")
+                .value_name("FILE")
+                .help("The config file to use")
+                .required(true)
+                .takes_value(true),
+        )
         .get_matches();
 
     // Read, parse, & verify config.
     let cfg = Arc::new({
         let config_filename = flags.value_of_os("config").unwrap();
-        let config_file = File::open(config_filename).expect("Could not open config file");
-        serde_yaml::from_reader(config_file).expect("Could not parse config file")
+        let config_file = File::open(config_filename).expect("Couldn't open config file");
+        serde_yaml::from_reader(config_file).expect("Couldn't parse config file")
     });
 
     // Main loop: accept & handle connections.
-    let listener = TcpListener::bind("0.0.0.0:443").expect("Could not listen for connections");
+    task::block_on(async {
+        let listener = TcpListener::bind("0.0.0.0:443")
+            .await
+            .expect("Couldn't listen for connections");
+        let mut incoming = listener.incoming();
 
-    info!("Listening for connections on port {}", listener.local_addr().unwrap().port());
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                let cfg = Arc::clone(&cfg);
-                thread::spawn(move || {
-                    let client_addr = stream.peer_addr().unwrap().ip();
-                    info!("[{}] Accepted connection", client_addr);
-                    match handle_connection(&cfg, stream) {
-                        Ok(_) => info!("[{}] Closed connection", client_addr),
-                        Err(e) => error!("[{}] Closed connection with error: {}", client_addr, e),
-                    };
-                });
+        info!(
+            "Listening for connections on port {}",
+            listener.local_addr().unwrap().port()
+        );
+
+        while let Some(stream) = incoming.next().await {
+            match stream {
+                Ok(stream) => {
+                    let cfg = Arc::clone(&cfg);
+                    task::spawn(async move {
+                        let client_addr = stream.peer_addr().unwrap().ip();
+                        info!("[{}] Accepted connection", client_addr);
+                        match handle_connection(&cfg, stream).await {
+                            Ok(_) => info!("[{}] Closed connection", client_addr),
+                            Err(err) => {
+                                error!("[{}] Closed connection with error: {}", client_addr, err)
+                            }
+                        }
+                    });
+                }
+                Err(err) => error!("Couldn't accept connection: {}", err),
             }
-            Err(e) => error!("Could not accept connection: {}", e),
         }
-    }
+    });
 }
 
 #[derive(Deserialize)]
@@ -72,194 +96,318 @@ struct Config {
     host_mappings: HashMap<String, String>,
 }
 
-fn handle_connection(cfg: &Config, client_stream: TcpStream) -> io::Result<()> {
+async fn handle_connection(cfg: &Config, client_stream: TcpStream) -> io::Result<()> {
     let client_addr = client_stream.peer_addr()?.ip();
-    client_stream.set_read_timeout(Some(time::Duration::from_secs(5)))?;
-    
     // Read SNI hostname.
-    let mut read_buf = Vec::new();
-    let sni_host_name = {
-        let mut reader = HandshakeRecordReader::new(BufReader::new(TeeReader::new(&client_stream, &mut read_buf)));
-        read_sni_host_name_from_handshake_message(&mut reader)?
+    let (sni_hostname, read_buf) = {
+        let mut recording_reader = RecordingReader::new(&client_stream);
+        let reader = HandshakeRecordReader::new(&mut recording_reader);
+        pin_mut!(reader);
+        let hostname = io::timeout(
+            Duration::from_secs(5),
+            read_sni_host_name_from_client_hello(reader),
+        )
+        .await?;
+        (hostname, recording_reader.buf())
     };
 
     // Determine server hostname & dial it.
-    let server_host = match cfg.host_mappings.get(&sni_host_name) {
+    let server_host = match cfg.host_mappings.get(&sni_hostname) {
         Some(server_host) => server_host,
-        None => return Err(io::Error::new(io::ErrorKind::InvalidData, format!("unknown SNI hostname {}", sni_host_name))),
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown SNI hostname {}", sni_hostname),
+            ))
+        }
     };
-    info!("[{}] Sent SNI hostname {}, mapping to {}", client_addr, sni_host_name, server_host);
-    let server_stream = Arc::new(TcpStream::connect(format!("{}:443", server_host))?);
+    info!(
+        "[{}] Sent SNI hostname {}, mapping to {}",
+        client_addr, sni_hostname, server_host
+    );
+    let client_stream = Arc::new(client_stream);
+    let server_stream = Arc::new(TcpStream::connect(format!("{}:443", server_host)).await?);
 
     // Copy data between client & server.
-    client_stream.set_read_timeout(None)?; // at this point, trust the timeouts of the server
-    let client_stream = Arc::new(client_stream);
     let client_to_server_handle = {
-        let (client_stream, server_stream) = (Arc::clone(&client_stream), Arc::clone(&server_stream));
-        thread::spawn(move || {
-            //server_stream.deref().write_all(&read_buf)?;
-            //io::copy(&mut client_stream.deref(), &mut server_stream.deref())?;
-            io::copy(&mut read_buf.chain(client_stream.deref()), &mut server_stream.deref())?;
+        let (client_stream, server_stream) =
+            (Arc::clone(&client_stream), Arc::clone(&server_stream));
+        task::spawn(async move {
+            io::copy(
+                &mut read_buf.chain(client_stream.deref()),
+                &mut server_stream.deref(),
+            )
+            .await?;
             // client_stream must be at EOF now. Ignore NotConnected errors on close.
-            server_stream.shutdown(net::Shutdown::Write).or_else(|err| {
-                match err.kind() {
+            server_stream
+                .shutdown(net::Shutdown::Write)
+                .or_else(|err| match err.kind() {
                     io::ErrorKind::NotConnected => Ok(()),
                     _ => Err(err),
-                }
-            })
+                })
         })
     };
-    let server_to_client_rslt = (move || {
-        io::copy(&mut server_stream.deref(), &mut client_stream.deref())?;
+    async move {
+        io::copy(&mut server_stream.deref(), &mut client_stream.deref()).await?;
         // server_stream must be at EOF now. Ignore NotConnected errors on close.
-        client_stream.shutdown(net::Shutdown::Write).or_else(|err| {
-            match err.kind() {
+        client_stream
+            .shutdown(net::Shutdown::Write)
+            .or_else(|err| match err.kind() {
                 io::ErrorKind::NotConnected => Ok(()),
                 _ => Err(err),
-            }
-        })
-    })();
-
-    let client_to_server_rslt = client_to_server_handle.join().unwrap();
-    client_to_server_rslt.and(server_to_client_rslt)
+            })
+    }
+    .await
+    .and(client_to_server_handle.await)
 }
 
-struct HandshakeRecordReader<R: Read>(Option<InternalHandshakeRecordReader<R>>);
+#[pin_project]
+struct RecordingReader<R: Read> {
+    #[pin]
+    reader: R,
+    buf: Vec<u8>,
+}
 
-impl<R: Read> HandshakeRecordReader<R> {
-    fn new(reader: R) -> HandshakeRecordReader<R> {
-        HandshakeRecordReader(Some(InternalHandshakeRecordReader::new(reader)))
+impl<R: Read> RecordingReader<R> {
+    fn new(reader: R) -> RecordingReader<R> {
+        RecordingReader {
+            reader: reader,
+            buf: Vec::new(),
+        }
+    }
+
+    fn buf(self: Self) -> Vec<u8> {
+        self.buf
     }
 }
 
-impl<R: Read> Read for HandshakeRecordReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let rslt = self.0.as_mut().expect("Read from already-errored HandshakeRecordReader").read(buf);
-        if rslt.is_err() {
-            self.0 = None
+impl<R: Read> Read for RecordingReader<R> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<Result<usize, Error>> {
+        let mut this = self.project();
+        let rslt = this.reader.as_mut().poll_read(cx, buf);
+        if let Poll::Ready(Ok(n)) = rslt {
+            this.buf.extend(&buf[..n]);
         }
         rslt
     }
 }
 
-struct InternalHandshakeRecordReader<R: Read> {
+#[pin_project]
+struct HandshakeRecordReader<R: Read> {
+    #[pin]
     reader: R,
-    rec_len: usize,
+    state: HandshakeRecordReaderState,
 }
 
-impl<R: Read> InternalHandshakeRecordReader<R> {
-    fn new(reader: R) -> InternalHandshakeRecordReader<R> {
-        InternalHandshakeRecordReader {
+impl<R: Read> HandshakeRecordReader<R> {
+    fn new(reader: R) -> HandshakeRecordReader<R> {
+        HandshakeRecordReader {
             reader: reader,
-            rec_len: 0,
+            state: HandshakeRecordReaderState::ReadingContentType,
         }
     }
 }
 
-impl<R: Read> Read for InternalHandshakeRecordReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.rec_len == 0 {
-            // Read record header to figure out how much record data we can read.
+enum HandshakeRecordReaderState {
+    ReadingContentType,
+    ReadingMajorMinorVersion(usize),
+    ReadingRecordSize([u8; 2], usize),
+    ReadingRecord(usize),
+}
 
-            // Content-type.
-            const CONTENT_TYPE_HANDSHAKE: u8 = 22;
-            let content_type = self.reader.read_u8()?;
-            if content_type != CONTENT_TYPE_HANDSHAKE {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, format!("got wrong content type (wanted {}, got {})", CONTENT_TYPE_HANDSHAKE, content_type)));
-            }
+impl<R: Read> Read for HandshakeRecordReader<R> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<Result<usize, Error>> {
+        let mut this = self.project();
+        loop {
+            match this.state {
+                HandshakeRecordReaderState::ReadingContentType => {
+                    const CONTENT_TYPE_HANDSHAKE: u8 = 22;
+                    let mut buf: [u8; 1] = [0];
+                    match this.reader.as_mut().poll_read(cx, &mut buf[..]) {
+                        Poll::Ready(Ok(1)) => {
+                            if buf[0] != CONTENT_TYPE_HANDSHAKE {
+                                return Poll::Ready(Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    format!(
+                                        "got wrong content type (wanted {}, got {})",
+                                        CONTENT_TYPE_HANDSHAKE, buf[0]
+                                    ),
+                                )));
+                            }
+                            *this.state = HandshakeRecordReaderState::ReadingMajorMinorVersion(2);
+                        }
+                        rslt => return rslt,
+                    }
+                }
 
-            // Major & minor version.
-            self.reader.read_u16::<NetworkEndian>()?;
+                HandshakeRecordReaderState::ReadingMajorMinorVersion(bytes_remaining) => {
+                    let mut buf: [u8; 2] = [0; 2];
+                    match this.reader.as_mut().poll_read(cx, &mut buf[..]) {
+                        Poll::Ready(Ok(n)) => {
+                            *bytes_remaining -= n;
+                            if *bytes_remaining == 0 {
+                                *this.state =
+                                    HandshakeRecordReaderState::ReadingRecordSize([0; 2], 2);
+                            }
+                        }
+                        rslt => return rslt,
+                    }
+                }
 
-            // Read record data length.
-            const MAX_RECORD_SIZE: usize = 1 << 14;
-            self.rec_len = self.reader.read_u16::<NetworkEndian>()?.into();
-            if self.rec_len > MAX_RECORD_SIZE {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, format!("record too large ({} > {})", self.rec_len, MAX_RECORD_SIZE)));
+                HandshakeRecordReaderState::ReadingRecordSize(buf, bytes_remaining) => {
+                    const MAX_RECORD_SIZE: usize = 1 << 14;
+                    match this
+                        .reader
+                        .as_mut()
+                        .poll_read(cx, &mut buf[2 - *bytes_remaining..])
+                    {
+                        Poll::Ready(Ok(n)) => {
+                            *bytes_remaining -= n;
+                            if *bytes_remaining == 0 {
+                                let record_size: usize = NetworkEndian::read_u16(buf).into();
+                                if record_size > MAX_RECORD_SIZE {
+                                    return Poll::Ready(Err(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        format!(
+                                            "record too large ({} > {})",
+                                            record_size, MAX_RECORD_SIZE
+                                        ),
+                                    )));
+                                }
+                                *this.state = HandshakeRecordReaderState::ReadingRecord(record_size)
+                            }
+                        }
+                        rslt => return rslt,
+                    }
+                }
+
+                HandshakeRecordReaderState::ReadingRecord(record_size) => {
+                    let read_len = min(*record_size, buf.len());
+                    let buf = &mut buf[..read_len];
+                    let rslt = this.reader.as_mut().poll_read(cx, buf);
+                    if let Poll::Ready(Ok(n)) = rslt {
+                        *record_size -= n;
+                        if *record_size == 0 {
+                            *this.state = HandshakeRecordReaderState::ReadingContentType;
+                        }
+                    }
+                    return rslt;
+                }
             }
         }
-
-        // Read up to the remainder of the current record into the provided buffer.
-        let read_len = min(self.rec_len, buf.len());
-        let buf = &mut buf[..read_len];
-        self.reader.read(buf).and_then(|sz| {
-            self.rec_len -= sz;
-            Ok(sz)
-        })
     }
 }
 
-fn read_sni_host_name_from_handshake_message<R: Read>(reader: &mut R) -> io::Result<String> {
+async fn read_sni_host_name_from_client_hello<R: Read>(
+    mut reader: Pin<&mut R>,
+) -> io::Result<String> {
     // Handshake message type.
     const HANDSHAKE_TYPE_CLIENT_HELLO: u8 = 1;
-    let typ = reader.read_u8()?;
+    let typ = read_u8(reader.as_mut()).await?;
     if typ != HANDSHAKE_TYPE_CLIENT_HELLO {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("handshake message not a ClientHello (type {}, expected {})", typ, HANDSHAKE_TYPE_CLIENT_HELLO)));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "handshake message not a ClientHello (type {}, expected {})",
+                typ, HANDSHAKE_TYPE_CLIENT_HELLO
+            ),
+        ));
     }
 
     // Handshake message length.
-    let len = reader.read_u24::<NetworkEndian>()?;
-    let mut reader = reader.take(len.into());
+    let len = read_u24(reader.as_mut()).await?;
+    let reader = reader.take(len.into());
+    pin_mut!(reader);
 
     // ProtocolVersion (2 bytes) & random (32 bytes).
-    skip(&mut reader, 34)?;
+    skip(reader.as_mut(), 34).await?;
 
     // Session ID (u8-length vec), cipher suites (u16-length vec), compression methods (u8-length vec).
-    skip_vec_u8(&mut reader)?;
-    skip_vec_u16(&mut reader)?;
-    skip_vec_u8(&mut reader)?;
+    skip_vec_u8(reader.as_mut()).await?;
+    skip_vec_u16(reader.as_mut()).await?;
+    skip_vec_u8(reader.as_mut()).await?;
 
     // Extensions.
-    let ext_len = reader.read_u16::<NetworkEndian>()?;
-    let mut reader = reader.take(ext_len.into());
+    let ext_len = read_u16(reader.as_mut()).await?;
+    let reader = reader.take(ext_len.into());
+    pin_mut!(reader);
     loop {
         // Extension type & length.
-        let ext_typ = reader.read_u16::<NetworkEndian>()?;
-        let ext_len = reader.read_u16::<NetworkEndian>()?;
+        let ext_typ = read_u16(reader.as_mut()).await?;
+        let ext_len = read_u16(reader.as_mut()).await?;
 
         const EXTENSION_TYPE_SNI: u16 = 0;
         if ext_typ != EXTENSION_TYPE_SNI {
-            skip(&mut reader, ext_len.into())?;
+            skip(reader.as_mut(), ext_len.into()).await?;
             continue;
         }
-        let mut reader = reader.take(ext_len.into());
+        let reader = reader.take(ext_len.into());
+        pin_mut!(reader);
 
         // ServerNameList length.
-        let snl_len = reader.read_u16::<NetworkEndian>()?;
-        let mut reader = reader.take(snl_len.into());
+        let snl_len = read_u16(reader.as_mut()).await?;
+        let reader = reader.take(snl_len.into());
+        pin_mut!(reader);
 
         // ServerNameList.
         loop {
             // NameType & length.
-            let name_typ = reader.read_u8()?;
+            let name_typ = read_u8(reader.as_mut()).await?;
 
             const NAME_TYPE_HOST_NAME: u8 = 0;
             if name_typ != NAME_TYPE_HOST_NAME {
-                skip_vec_u16(&mut reader)?;
+                skip_vec_u16(reader.as_mut()).await?;
                 continue;
             }
 
-            let name_len = reader.read_u16::<NetworkEndian>()?;
+            let name_len = read_u16(reader.as_mut()).await?;
             let mut name_buf = vec![0; name_len.into()];
-            reader.read_exact(&mut name_buf)?;
+            reader.read_exact(&mut name_buf).await?;
             return match String::from_utf8(name_buf) {
                 Ok(s) => Ok(s),
                 Err(err) => Err(io::Error::new(io::ErrorKind::InvalidData, err)),
-            }
+            };
         }
     }
 }
 
-fn skip<R: Read>(reader: &mut R, len: u64) -> io::Result<()> {
-    io::copy(&mut reader.take(len), &mut io::sink()).and_then(|_| Ok(()))
+async fn skip<R: Read>(reader: Pin<&mut R>, len: u64) -> io::Result<()> {
+    io::copy(&mut reader.take(len), &mut io::sink()).await?;
+    Ok(())
 }
 
-fn skip_vec_u8<R: Read>(reader: &mut R) -> io::Result<()> {
-    let sz = reader.read_u8()?;
-    skip(reader, sz.into())
+async fn skip_vec_u8<R: Read>(mut reader: Pin<&mut R>) -> io::Result<()> {
+    let sz = read_u8(reader.as_mut()).await?;
+    skip(reader.as_mut(), sz.into()).await
 }
 
-fn skip_vec_u16<R: Read>(reader: &mut R) -> io::Result<()> {
-    let sz = reader.read_u16::<NetworkEndian>()?;
-    skip(reader, sz.into())
+async fn skip_vec_u16<R: Read>(mut reader: Pin<&mut R>) -> io::Result<()> {
+    let sz = read_u16(reader.as_mut()).await?;
+    skip(reader.as_mut(), sz.into()).await
+}
+
+async fn read_u8<R: Read>(mut reader: Pin<&mut R>) -> io::Result<u8> {
+    let mut buf = [0; 1];
+    reader.as_mut().read_exact(&mut buf).await?;
+    Ok(buf[0])
+}
+
+async fn read_u16<R: Read>(mut reader: Pin<&mut R>) -> io::Result<u16> {
+    let mut buf = [0; 2];
+    reader.as_mut().read_exact(&mut buf).await?;
+    Ok(NetworkEndian::read_u16(&buf))
+}
+
+async fn read_u24<R: Read>(mut reader: Pin<&mut R>) -> io::Result<u32> {
+    let mut buf = [0; 3];
+    reader.as_mut().read_exact(&mut buf).await?;
+    Ok(NetworkEndian::read_u24(&buf))
 }
