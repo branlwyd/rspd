@@ -75,7 +75,15 @@ fn main() {
                 Ok(stream) => {
                     let cfg = Arc::clone(&cfg);
                     task::spawn(async move {
-                        let client_addr = stream.peer_addr().unwrap().ip();
+                        let client_addr = match stream.peer_addr() {
+                            Ok(peer_addr) => peer_addr.ip(),
+                            Err(err) if err.kind() == io::ErrorKind::NotConnected => return, // silently ignore clients that quickly close connection
+                            Err(err) => {
+                                error!("Couldn't get client address: {}", err);
+                                return;
+                            }
+                        };
+
                         info!("[{}] Accepted connection", client_addr);
                         match handle_connection(&cfg, stream).await {
                             Ok(_) => info!("[{}] Closed connection", client_addr),
