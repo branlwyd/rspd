@@ -1,17 +1,17 @@
 [package]
 name = "rspd"
-version = "0.1.0"
-authors = ["Brandon Pitman <brandon.pitman@gmail.com>"]
-edition = "2018"
+version = "1.0.0"
+authors = ["Brandon Pitman <bran@bran.land>"]
+edition = "2021"
 
 [dependencies]
-async-std = {version = "1.10"}
-byteorder = "1.2.7"
-clap = "2.32"
-log = "0.4.6"
-pin-project = "1.0.8"
+async-std = "1"
+byteorder = "1"
+clap = "2"
+log = "0.4"
+pin-project = "1"
 pin-utils = "0.1.0"
-serde = "1.0"
-serde_derive = "1.0"
+serde = "1"
+serde_derive = "1"
 serde_yaml = "0.8"
-simple_logger = "1.0.1"
+simple_logger = "1"

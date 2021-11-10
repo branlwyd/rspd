@@ -38,8 +38,8 @@ fn main() {
     // Initialize, parse & verify flags.
     simple_logger::init_with_level(Level::Info).expect("Couldn't initialize logging");
     let flags = clap::App::new("rspd")
-        .version("0.1")
-        .author("Brandon Pitman <brandon.pitman@gmail.com>")
+        .version("1.0.0")
+        .author("Brandon Pitman <bran@bran.land>")
         .about("Simple SNI-based HTTPS proxy.")
         .arg(
             clap::Arg::with_name("config")
