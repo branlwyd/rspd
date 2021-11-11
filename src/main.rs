@@ -23,7 +23,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::{self, AsyncRead, AsyncReadExt, Error, ReadBuf};
+use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, Error, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task;
 use tokio::time;
@@ -37,7 +37,7 @@ async fn main() {
     // Initialize, parse & verify flags.
     simple_logger::init_with_level(Level::Info).expect("Couldn't initialize logging");
     let flags = clap::App::new("rspd")
-        .version("1.0.0")
+        .version(env!("CARGO_PKG_VERSION"))
         .author("Brandon Pitman <bran@bran.land>")
         .about("Simple SNI-based HTTPS proxy.")
         .arg(
@@ -178,9 +178,77 @@ impl<R: AsyncRead> AsyncRead for RecordingReader<R> {
         let rslt = this.reader.as_mut().poll_read(cx, buf);
         if let Poll::Ready(Ok(())) = rslt {
             let filled = buf.filled();
-            this.buf.extend(&filled[n + 1..]);
+            this.buf.extend(&filled[n..]);
         }
         rslt
+    }
+}
+
+#[pin_project]
+struct PrefixedReaderWriter<T: AsyncRead + AsyncWrite> {
+    #[pin]
+    inner: T,
+    prefix: Vec<u8>,
+    read_prefix: usize,
+}
+
+impl<'a, T: AsyncRead + AsyncWrite> PrefixedReaderWriter<T> {
+    fn new(inner: T, prefix: Vec<u8>) -> PrefixedReaderWriter<T> {
+        PrefixedReaderWriter {
+            inner,
+            prefix,
+            read_prefix: 0,
+        }
+    }
+}
+
+impl<T: AsyncRead + AsyncWrite> AsyncRead for PrefixedReaderWriter<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.project();
+        if this.prefix.is_empty() {
+            return this.inner.poll_read(cx, buf);
+        }
+
+        let read_prefix = *this.read_prefix;
+        let prefix = &this.prefix[read_prefix..];
+        let read_size = min(buf.remaining(), prefix.len());
+        buf.put_slice(&prefix[..read_size]);
+        *this.read_prefix += read_size;
+
+        if *this.read_prefix == this.prefix.len() {
+            this.prefix.clear();
+            this.prefix.shrink_to(0);
+        }
+
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl<T: AsyncRead + AsyncWrite> AsyncWrite for PrefixedReaderWriter<T> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        let this = self.project();
+        this.inner.poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
+        let this = self.project();
+        this.inner.poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        let this = self.project();
+        this.inner.poll_shutdown(cx)
     }
 }
 
