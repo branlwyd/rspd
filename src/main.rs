@@ -20,7 +20,6 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, Error, ReadBuf};
@@ -51,11 +50,11 @@ async fn main() {
         .get_matches();
 
     // Read, parse, & verify config.
-    let cfg = Arc::new({
+    let cfg: &'static Config = Box::leak(Box::new({
         let config_filename = flags.value_of_os("config").unwrap();
         let config_file = File::open(config_filename).expect("Couldn't open config file");
         serde_yaml::from_reader(config_file).expect("Couldn't parse config file")
-    });
+    }));
 
     // Main loop: accept & handle connections.
     #[cfg(not(debug_assertions))]
@@ -70,7 +69,6 @@ async fn main() {
     loop {
         match listener.accept().await {
             Ok((stream, client_addr)) => {
-                let cfg = Arc::clone(&cfg);
                 task::spawn(async move {
                     info!("[{}] Accepted connection", client_addr);
                     match handle_connection(&cfg, client_addr, stream).await {
