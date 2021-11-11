@@ -1,4 +1,3 @@
-extern crate async_std;
 extern crate byteorder;
 extern crate clap;
 #[macro_use]
@@ -12,29 +11,29 @@ extern crate serde;
 extern crate serde_derive;
 extern crate serde_yaml;
 extern crate simple_logger;
+extern crate tokio;
 
-use async_std::prelude::*;
-
-use async_std::io;
-use async_std::io::{Error, Read};
-use async_std::net::{TcpListener, TcpStream};
-use async_std::task;
 use byteorder::{ByteOrder, NetworkEndian};
 use log::Level;
 use std::cmp::min;
 use std::collections::HashMap;
 use std::fs::File;
-use std::net;
-use std::ops::Deref;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
+use tokio::io::{self, AsyncRead, AsyncReadExt, Error, ReadBuf};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::task;
+use tokio::time;
 
+// TODO: use tokio::io::copy_bidirectional for client-server communications (need to write wrapper allowing reads from buf before conn)
 // TODO: re-implement HandshakeRecordReader in a saner way and nuke the existing implementation from orbit
 // TODO: implement read_u{8,16,24} as an extension trait on Read once async traits functions are supported
 
-fn main() {
+#[tokio::main]
+async fn main() {
     // Initialize, parse & verify flags.
     simple_logger::init_with_level(Level::Info).expect("Couldn't initialize logging");
     let flags = clap::App::new("rspd")
@@ -59,44 +58,33 @@ fn main() {
     });
 
     // Main loop: accept & handle connections.
-    task::block_on(async {
-        let listener = TcpListener::bind("0.0.0.0:443")
-            .await
-            .expect("Couldn't listen for connections");
-        let mut incoming = listener.incoming();
+    #[cfg(not(debug_assertions))]
+    const LISTEN_PORT: u16 = 443;
+    #[cfg(debug_assertions)]
+    const LISTEN_PORT: u16 = 10443;
+    let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, LISTEN_PORT))
+        .await
+        .expect("Couldn't listen for connections");
 
-        info!(
-            "Listening for connections on port {}",
-            listener.local_addr().unwrap().port()
-        );
+    info!(
+        "Listening for connections on port {}",
+        listener.local_addr().unwrap().port()
+    );
 
-        while let Some(stream) = incoming.next().await {
-            match stream {
-                Ok(stream) => {
-                    let cfg = Arc::clone(&cfg);
-                    task::spawn(async move {
-                        let client_addr = match stream.peer_addr() {
-                            Ok(peer_addr) => peer_addr.ip(),
-                            Err(err) if err.kind() == io::ErrorKind::NotConnected => return, // silently ignore clients that quickly close connection
-                            Err(err) => {
-                                error!("Couldn't get client address: {}", err);
-                                return;
-                            }
-                        };
-
-                        info!("[{}] Accepted connection", client_addr);
-                        match handle_connection(&cfg, stream).await {
-                            Ok(_) => info!("[{}] Closed connection", client_addr),
-                            Err(err) => {
-                                error!("[{}] Closed connection with error: {}", client_addr, err)
-                            }
-                        }
-                    });
+    loop {
+        match listener.accept().await {
+            Ok((stream, client_addr)) => {
+                info!("[{}] Accepted connection", client_addr);
+                match handle_connection(&cfg, client_addr, stream).await {
+                    Ok(_) => info!("[{}] Closed connection", client_addr),
+                    Err(err) => {
+                        error!("[{}] Closed connection with error: {}", client_addr, err)
+                    }
                 }
-                Err(err) => error!("Couldn't accept connection: {}", err),
             }
+            Err(err) => error!("Couldn't accept connection: {}", err),
         }
-    });
+    }
 }
 
 #[derive(Deserialize)]
@@ -104,19 +92,23 @@ struct Config {
     host_mappings: HashMap<String, String>,
 }
 
-async fn handle_connection(cfg: &Config, client_stream: TcpStream) -> io::Result<()> {
-    let client_addr = client_stream.peer_addr()?.ip();
+async fn handle_connection(
+    cfg: &Config,
+    client_addr: SocketAddr,
+    client_stream: TcpStream,
+) -> io::Result<()> {
     // Read SNI hostname.
-    let (sni_hostname, read_buf) = {
-        let mut recording_reader = RecordingReader::new(&client_stream);
+    let (sni_hostname, client_stream, read_buf) = {
+        let mut recording_reader = RecordingReader::new(client_stream);
         let reader = HandshakeRecordReader::new(&mut recording_reader);
         pin_mut!(reader);
-        let hostname = io::timeout(
+        let hostname = time::timeout(
             Duration::from_secs(5),
             read_sni_host_name_from_client_hello(reader),
         )
-        .await?;
-        (hostname, recording_reader.buf())
+        .await??;
+        let (client_stream, read_buf) = recording_reader.deconstruct();
+        (hostname, client_stream, read_buf)
     };
 
     // Determine server hostname & dial it.
@@ -133,50 +125,36 @@ async fn handle_connection(cfg: &Config, client_stream: TcpStream) -> io::Result
         "[{}] Sent SNI hostname {}, mapping to {}",
         client_addr, sni_hostname, server_host
     );
-    let client_stream = Arc::new(client_stream);
-    let server_stream = Arc::new(TcpStream::connect(format!("{}:443", server_host)).await?);
+    let (client_read_stream, mut client_write_stream) = client_stream.into_split();
+    let (mut server_read_stream, mut server_write_stream) =
+        TcpStream::connect((&server_host[..], 443))
+            .await?
+            .into_split();
 
     // Copy data between client & server.
     let client_to_server_handle = {
-        let (client_stream, server_stream) =
-            (Arc::clone(&client_stream), Arc::clone(&server_stream));
         task::spawn(async move {
             io::copy(
-                &mut read_buf.chain(client_stream.deref()),
-                &mut server_stream.deref(),
+                &mut read_buf.chain(client_read_stream),
+                &mut server_write_stream,
             )
             .await?;
-            // client_stream must be at EOF now. Ignore NotConnected errors on close.
-            server_stream
-                .shutdown(net::Shutdown::Write)
-                .or_else(|err| match err.kind() {
-                    io::ErrorKind::NotConnected => Ok(()),
-                    _ => Err(err),
-                })
+            Ok(())
         })
     };
-    async move {
-        io::copy(&mut server_stream.deref(), &mut client_stream.deref()).await?;
-        // server_stream must be at EOF now. Ignore NotConnected errors on close.
-        client_stream
-            .shutdown(net::Shutdown::Write)
-            .or_else(|err| match err.kind() {
-                io::ErrorKind::NotConnected => Ok(()),
-                _ => Err(err),
-            })
-    }
-    .await
-    .and(client_to_server_handle.await)
+    io::copy(&mut server_read_stream, &mut client_write_stream)
+        .await
+        .and(client_to_server_handle.await?)
 }
 
 #[pin_project]
-struct RecordingReader<R: Read> {
+struct RecordingReader<R: AsyncRead> {
     #[pin]
     reader: R,
     buf: Vec<u8>,
 }
 
-impl<R: Read> RecordingReader<R> {
+impl<R: AsyncRead> RecordingReader<R> {
     fn new(reader: R) -> RecordingReader<R> {
         RecordingReader {
             reader: reader,
@@ -184,34 +162,36 @@ impl<R: Read> RecordingReader<R> {
         }
     }
 
-    fn buf(self: Self) -> Vec<u8> {
-        self.buf
+    fn deconstruct(self: Self) -> (R, Vec<u8>) {
+        (self.reader, self.buf)
     }
 }
 
-impl<R: Read> Read for RecordingReader<R> {
+impl<R: AsyncRead> AsyncRead for RecordingReader<R> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<Result<usize, Error>> {
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<Result<(), Error>> {
         let mut this = self.project();
+        let n = buf.filled().len();
         let rslt = this.reader.as_mut().poll_read(cx, buf);
-        if let Poll::Ready(Ok(n)) = rslt {
-            this.buf.extend(&buf[..n]);
+        if let Poll::Ready(Ok(())) = rslt {
+            let filled = buf.filled();
+            this.buf.extend(&filled[n + 1..]);
         }
         rslt
     }
 }
 
 #[pin_project]
-struct HandshakeRecordReader<R: Read> {
+struct HandshakeRecordReader<R: AsyncRead> {
     #[pin]
     reader: R,
     state: HandshakeRecordReaderState,
 }
 
-impl<R: Read> HandshakeRecordReader<R> {
+impl<R: AsyncRead> HandshakeRecordReader<R> {
     fn new(reader: R) -> HandshakeRecordReader<R> {
         HandshakeRecordReader {
             reader: reader,
@@ -227,60 +207,63 @@ enum HandshakeRecordReaderState {
     ReadingRecord(usize),
 }
 
-impl<R: Read> Read for HandshakeRecordReader<R> {
+impl<R: AsyncRead> AsyncRead for HandshakeRecordReader<R> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<Result<usize, Error>> {
+        caller_buf: &mut ReadBuf<'_>,
+    ) -> Poll<Result<(), Error>> {
         let mut this = self.project();
         loop {
             match this.state {
                 HandshakeRecordReaderState::ReadingContentType => {
                     const CONTENT_TYPE_HANDSHAKE: u8 = 22;
-                    let mut buf: [u8; 1] = [0];
-                    match this.reader.as_mut().poll_read(cx, &mut buf[..]) {
-                        Poll::Ready(Ok(1)) => {
-                            if buf[0] != CONTENT_TYPE_HANDSHAKE {
+                    let mut buf = [0];
+                    let mut buf = ReadBuf::new(&mut buf[..]);
+                    match this.reader.as_mut().poll_read(cx, &mut buf) {
+                        Poll::Ready(Ok(())) if buf.filled().len() == 1 => {
+                            if buf.filled()[0] != CONTENT_TYPE_HANDSHAKE {
                                 return Poll::Ready(Err(io::Error::new(
                                     io::ErrorKind::InvalidData,
                                     format!(
                                         "got wrong content type (wanted {}, got {})",
-                                        CONTENT_TYPE_HANDSHAKE, buf[0]
+                                        CONTENT_TYPE_HANDSHAKE,
+                                        buf.filled()[0]
                                     ),
                                 )));
                             }
-                            *this.state = HandshakeRecordReaderState::ReadingMajorMinorVersion(2);
+                            *this.state = HandshakeRecordReaderState::ReadingMajorMinorVersion(0);
                         }
                         rslt => return rslt,
                     }
                 }
 
-                HandshakeRecordReaderState::ReadingMajorMinorVersion(bytes_remaining) => {
-                    let mut buf: [u8; 2] = [0; 2];
-                    match this.reader.as_mut().poll_read(cx, &mut buf[..]) {
-                        Poll::Ready(Ok(n)) => {
-                            *bytes_remaining -= n;
-                            if *bytes_remaining == 0 {
+                HandshakeRecordReaderState::ReadingMajorMinorVersion(bytes_read) => {
+                    let mut buf = [0, 0];
+                    let mut buf = ReadBuf::new(&mut buf[..]);
+                    buf.advance(*bytes_read);
+                    match this.reader.as_mut().poll_read(cx, &mut buf) {
+                        Poll::Ready(Ok(())) => {
+                            *bytes_read = buf.filled().len();
+                            if *bytes_read == 2 {
                                 *this.state =
-                                    HandshakeRecordReaderState::ReadingRecordSize([0; 2], 2);
+                                    HandshakeRecordReaderState::ReadingRecordSize([0, 0], 0);
                             }
                         }
                         rslt => return rslt,
                     }
                 }
 
-                HandshakeRecordReaderState::ReadingRecordSize(buf, bytes_remaining) => {
+                HandshakeRecordReaderState::ReadingRecordSize(buf, bytes_read) => {
                     const MAX_RECORD_SIZE: usize = 1 << 14;
-                    match this
-                        .reader
-                        .as_mut()
-                        .poll_read(cx, &mut buf[2 - *bytes_remaining..])
-                    {
-                        Poll::Ready(Ok(n)) => {
-                            *bytes_remaining -= n;
-                            if *bytes_remaining == 0 {
-                                let record_size: usize = NetworkEndian::read_u16(buf).into();
+                    let mut buf = ReadBuf::new(&mut buf[..]);
+                    buf.advance(*bytes_read);
+                    match this.reader.as_mut().poll_read(cx, &mut buf) {
+                        Poll::Ready(Ok(())) => {
+                            *bytes_read = buf.filled().len();
+                            if *bytes_read == 2 {
+                                let record_size: usize =
+                                    NetworkEndian::read_u16(buf.filled()).into();
                                 if record_size > MAX_RECORD_SIZE {
                                     return Poll::Ready(Err(io::Error::new(
                                         io::ErrorKind::InvalidData,
@@ -297,13 +280,30 @@ impl<R: Read> Read for HandshakeRecordReader<R> {
                     }
                 }
 
-                HandshakeRecordReaderState::ReadingRecord(record_size) => {
-                    let read_len = min(*record_size, buf.len());
-                    let buf = &mut buf[..read_len];
-                    let rslt = this.reader.as_mut().poll_read(cx, buf);
-                    if let Poll::Ready(Ok(n)) = rslt {
-                        *record_size -= n;
-                        if *record_size == 0 {
+                HandshakeRecordReaderState::ReadingRecord(remaining_record_bytes) => {
+                    // This is gross: we want to read into caller_buf, BUT calling `take` gives a
+                    // ReadBuf that has the same underlying buffer but an independent filled
+                    // cursor. So we have to call `advance` manually, BUT to avoid panics we also
+                    // have to call `initialize_unfilled_to` to ensure we don't advance into
+                    // uninitialized memory.
+                    //
+                    // This is a terribly-designed API. A better API would have caused `take` to
+                    // return a "view" that updated the "filled" cursor of the covered ReadBuf,
+                    // too, rather than requiring every single user of the API to figure out that
+                    // this is required and implement it every time they want a limited read.
+
+                    caller_buf.initialize_unfilled_to(min(
+                        caller_buf.remaining(),
+                        *remaining_record_bytes,
+                    ));
+                    let mut buf = caller_buf.take(*remaining_record_bytes);
+                    let old_bytes_read = buf.filled().len();
+                    let rslt = this.reader.as_mut().poll_read(cx, &mut buf);
+                    if let Poll::Ready(Ok(())) = rslt {
+                        let bytes_read = buf.filled().len() - old_bytes_read;
+                        caller_buf.advance(bytes_read);
+                        *remaining_record_bytes -= bytes_read;
+                        if *remaining_record_bytes == 0 {
                             *this.state = HandshakeRecordReaderState::ReadingContentType;
                         }
                     }
@@ -314,7 +314,7 @@ impl<R: Read> Read for HandshakeRecordReader<R> {
     }
 }
 
-async fn read_sni_host_name_from_client_hello<R: Read>(
+async fn read_sni_host_name_from_client_hello<R: AsyncRead>(
     mut reader: Pin<&mut R>,
 ) -> io::Result<String> {
     // Handshake message type.
@@ -387,34 +387,34 @@ async fn read_sni_host_name_from_client_hello<R: Read>(
     }
 }
 
-async fn skip<R: Read>(reader: Pin<&mut R>, len: u64) -> io::Result<()> {
+async fn skip<R: AsyncRead>(reader: Pin<&mut R>, len: u64) -> io::Result<()> {
     io::copy(&mut reader.take(len), &mut io::sink()).await?;
     Ok(())
 }
 
-async fn skip_vec_u8<R: Read>(mut reader: Pin<&mut R>) -> io::Result<()> {
+async fn skip_vec_u8<R: AsyncRead>(mut reader: Pin<&mut R>) -> io::Result<()> {
     let sz = read_u8(reader.as_mut()).await?;
     skip(reader.as_mut(), sz.into()).await
 }
 
-async fn skip_vec_u16<R: Read>(mut reader: Pin<&mut R>) -> io::Result<()> {
+async fn skip_vec_u16<R: AsyncRead>(mut reader: Pin<&mut R>) -> io::Result<()> {
     let sz = read_u16(reader.as_mut()).await?;
     skip(reader.as_mut(), sz.into()).await
 }
 
-async fn read_u8<R: Read>(mut reader: Pin<&mut R>) -> io::Result<u8> {
+async fn read_u8<R: AsyncRead>(mut reader: Pin<&mut R>) -> io::Result<u8> {
     let mut buf = [0; 1];
     reader.as_mut().read_exact(&mut buf).await?;
     Ok(buf[0])
 }
 
-async fn read_u16<R: Read>(mut reader: Pin<&mut R>) -> io::Result<u16> {
+async fn read_u16<R: AsyncRead>(mut reader: Pin<&mut R>) -> io::Result<u16> {
     let mut buf = [0; 2];
     reader.as_mut().read_exact(&mut buf).await?;
     Ok(NetworkEndian::read_u16(&buf))
 }
 
-async fn read_u24<R: Read>(mut reader: Pin<&mut R>) -> io::Result<u32> {
+async fn read_u24<R: AsyncRead>(mut reader: Pin<&mut R>) -> io::Result<u32> {
     let mut buf = [0; 3];
     reader.as_mut().read_exact(&mut buf).await?;
     Ok(NetworkEndian::read_u24(&buf))
