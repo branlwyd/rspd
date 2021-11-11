@@ -25,10 +25,8 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, Error, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::task;
 use tokio::time;
 
-// TODO: use tokio::io::copy_bidirectional for client-server communications (need to write wrapper allowing reads from buf before conn)
 // TODO: re-implement HandshakeRecordReader in a saner way and nuke the existing implementation from orbit
 // TODO: implement read_u{8,16,24} as an extension trait on Read once async traits functions are supported
 
@@ -125,26 +123,11 @@ async fn handle_connection(
         "[{}] Sent SNI hostname {}, mapping to {}",
         client_addr, sni_hostname, server_host
     );
-    let (client_read_stream, mut client_write_stream) = client_stream.into_split();
-    let (mut server_read_stream, mut server_write_stream) =
-        TcpStream::connect((&server_host[..], 443))
-            .await?
-            .into_split();
 
-    // Copy data between client & server.
-    let client_to_server_handle = {
-        task::spawn(async move {
-            io::copy(
-                &mut read_buf.chain(client_read_stream),
-                &mut server_write_stream,
-            )
-            .await?;
-            Ok(())
-        })
-    };
-    io::copy(&mut server_read_stream, &mut client_write_stream)
-        .await
-        .and(client_to_server_handle.await?)
+    let mut client_stream = PrefixedReaderWriter::new(client_stream, read_buf);
+    let mut server_stream = TcpStream::connect((&server_host[..], 443)).await?;
+    io::copy_bidirectional(&mut client_stream, &mut server_stream).await?;
+    Ok(())
 }
 
 #[pin_project]
