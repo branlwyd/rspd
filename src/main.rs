@@ -25,6 +25,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, Error, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::task;
 use tokio::time;
 
 // TODO: re-implement HandshakeRecordReader in a saner way and nuke the existing implementation from orbit
@@ -72,13 +73,16 @@ async fn main() {
     loop {
         match listener.accept().await {
             Ok((stream, client_addr)) => {
-                info!("[{}] Accepted connection", client_addr);
-                match handle_connection(&cfg, client_addr, stream).await {
-                    Ok(_) => info!("[{}] Closed connection", client_addr),
-                    Err(err) => {
-                        error!("[{}] Closed connection with error: {}", client_addr, err)
+                let cfg = Arc::clone(&cfg);
+                task::spawn(async move {
+                    info!("[{}] Accepted connection", client_addr);
+                    match handle_connection(&cfg, client_addr, stream).await {
+                        Ok(_) => info!("[{}] Closed connection", client_addr),
+                        Err(err) => {
+                            error!("[{}] Closed connection with error: {}", client_addr, err)
+                        }
                     }
-                }
+                });
             }
             Err(err) => error!("Couldn't accept connection: {}", err),
         }
