@@ -28,6 +28,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::task;
 use tokio::time;
 
+// TODO: add buffered reads from the client_stream somehow
 // TODO: re-implement HandshakeRecordReader in a saner way and nuke the existing implementation from orbit
 // TODO: implement read_u{8,16,24} as an extension trait on Read once async traits functions are supported
 
