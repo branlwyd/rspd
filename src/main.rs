@@ -65,11 +65,7 @@ async fn main() {
     let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, LISTEN_PORT))
         .await
         .expect("Couldn't listen for connections");
-
-    info!(
-        "Listening for connections on port {}",
-        listener.local_addr().unwrap().port()
-    );
+    info!("Listening for connections on port {}", LISTEN_PORT);
 
     loop {
         match listener.accept().await {
