@@ -18,6 +18,7 @@ use log::Level;
 use std::cmp::min;
 use std::collections::HashMap;
 use std::fs::File;
+use std::mem;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -198,8 +199,7 @@ impl<T: AsyncRead + AsyncWrite> AsyncRead for PrefixedReaderWriter<T> {
         *this.read_prefix += read_size;
 
         if *this.read_prefix == this.prefix.len() {
-            this.prefix.clear();
-            this.prefix.shrink_to(0);
+            mem::take(this.prefix);
         }
 
         Poll::Ready(Ok(()))
