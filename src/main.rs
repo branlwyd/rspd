@@ -1,3 +1,4 @@
+#![feature(vec_spare_capacity)]
 extern crate byteorder;
 extern crate clap;
 #[macro_use]
@@ -23,7 +24,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, BufReader, Error, ReadBuf};
+use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, Error, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task;
 use tokio::time;
@@ -95,8 +96,8 @@ async fn handle_connection(
     mut client_stream: TcpStream,
 ) -> io::Result<()> {
     // Read SNI hostname.
-    let mut recording_reader = RecordingReader::new(&mut client_stream);
-    let reader = HandshakeRecordReader::new(BufReader::new(&mut recording_reader));
+    let mut recording_reader = RecordingBufReader::new(&mut client_stream);
+    let reader = HandshakeRecordReader::new(&mut recording_reader);
     pin_mut!(reader);
     let sni_hostname = time::timeout(
         Duration::from_secs(5),
@@ -127,17 +128,21 @@ async fn handle_connection(
 }
 
 #[pin_project]
-struct RecordingReader<R: AsyncRead> {
+struct RecordingBufReader<R: AsyncRead> {
     #[pin]
     reader: R,
     buf: Vec<u8>,
+    read_offset: usize,
 }
 
-impl<R: AsyncRead> RecordingReader<R> {
-    fn new(reader: R) -> RecordingReader<R> {
-        RecordingReader {
+const RECORDING_READER_BUF_SIZE: usize = 1 << 10; // 1 KiB
+
+impl<R: AsyncRead> RecordingBufReader<R> {
+    fn new(reader: R) -> RecordingBufReader<R> {
+        RecordingBufReader {
             reader,
-            buf: Vec::new(),
+            buf: Vec::with_capacity(RECORDING_READER_BUF_SIZE),
+            read_offset: 0,
         }
     }
 
@@ -146,20 +151,36 @@ impl<R: AsyncRead> RecordingReader<R> {
     }
 }
 
-impl<R: AsyncRead> AsyncRead for RecordingReader<R> {
+impl<R: AsyncRead> AsyncRead for RecordingBufReader<R> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
+        caller_buf: &mut ReadBuf<'_>,
     ) -> Poll<Result<(), Error>> {
+        // if we don't have any buffered bytes, read some bytes into our buffer.
         let mut this = self.project();
-        let n = buf.filled().len();
-        let rslt = this.reader.as_mut().poll_read(cx, buf);
-        if let Poll::Ready(Ok(())) = rslt {
-            let filled = buf.filled();
-            this.buf.extend(&filled[n..]);
+        if *this.read_offset == this.buf.len() {
+            this.buf.reserve(RECORDING_READER_BUF_SIZE);
+            let mut read_buf = ReadBuf::uninit(this.buf.spare_capacity_mut());
+            let rslt = this.reader.as_mut().poll_read(cx, &mut read_buf);
+            match rslt {
+                Poll::Ready(Ok(())) => {
+                    let bytes_read = read_buf.filled().len();
+                    let new_len = this.buf.len() + bytes_read;
+                    unsafe {
+                        this.buf.set_len(new_len); // lol
+                    }
+                }
+                rslt => return rslt,
+            };
         }
-        rslt
+
+        // read from the buffered bytes into the caller's buffer.
+        let unread_bytes = &this.buf[*this.read_offset..];
+        let n = min(caller_buf.remaining(), unread_bytes.len());
+        caller_buf.put_slice(&unread_bytes[..n]);
+        *this.read_offset += n;
+        Poll::Ready(Ok(()))
     }
 }
 
