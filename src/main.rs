@@ -22,12 +22,11 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, Error, ReadBuf};
+use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, BufReader, Error, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task;
 use tokio::time;
 
-// TODO: add buffered reads from the client_stream somehow
 // TODO: re-implement HandshakeRecordReader in a saner way and nuke the existing implementation from orbit
 // TODO: implement read_u{8,16,24} as an extension trait on Read once async traits functions are supported
 
@@ -92,21 +91,18 @@ struct Config {
 async fn handle_connection(
     cfg: &Config,
     client_addr: SocketAddr,
-    client_stream: TcpStream,
+    mut client_stream: TcpStream,
 ) -> io::Result<()> {
     // Read SNI hostname.
-    let (sni_hostname, client_stream, read_buf) = {
-        let mut recording_reader = RecordingReader::new(client_stream);
-        let reader = HandshakeRecordReader::new(&mut recording_reader);
-        pin_mut!(reader);
-        let hostname = time::timeout(
-            Duration::from_secs(5),
-            read_sni_host_name_from_client_hello(reader),
-        )
-        .await??;
-        let (client_stream, read_buf) = recording_reader.deconstruct();
-        (hostname, client_stream, read_buf)
-    };
+    let mut recording_reader = RecordingReader::new(&mut client_stream);
+    let reader = HandshakeRecordReader::new(BufReader::new(&mut recording_reader));
+    pin_mut!(reader);
+    let sni_hostname = time::timeout(
+        Duration::from_secs(5),
+        read_sni_host_name_from_client_hello(reader),
+    )
+    .await??;
+    let read_buf = recording_reader.buf();
 
     // Determine server hostname & dial it.
     let server_host = match cfg.host_mappings.get(&sni_hostname) {
@@ -144,8 +140,8 @@ impl<R: AsyncRead> RecordingReader<R> {
         }
     }
 
-    fn deconstruct(self: Self) -> (R, Vec<u8>) {
-        (self.reader, self.buf)
+    fn buf(self: Self) -> Vec<u8> {
+        self.buf
     }
 }
 
