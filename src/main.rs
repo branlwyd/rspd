@@ -70,7 +70,7 @@ async fn main() {
             Ok((stream, client_addr)) => {
                 task::spawn(async move {
                     info!("[{}] Accepted connection", client_addr);
-                    match handle_connection(&cfg, client_addr, stream).await {
+                    match handle_connection(cfg, client_addr, stream).await {
                         Ok(_) => info!("[{}] Closed connection", client_addr),
                         Err(err) => {
                             error!("[{}] Closed connection with error: {}", client_addr, err)
@@ -135,12 +135,12 @@ struct RecordingReader<R: AsyncRead> {
 impl<R: AsyncRead> RecordingReader<R> {
     fn new(reader: R) -> RecordingReader<R> {
         RecordingReader {
-            reader: reader,
+            reader,
             buf: Vec::new(),
         }
     }
 
-    fn buf(self: Self) -> Vec<u8> {
+    fn buf(self) -> Vec<u8> {
         self.buf
     }
 }
@@ -234,23 +234,23 @@ impl<T: AsyncRead + AsyncWrite> AsyncWrite for PrefixedReaderWriter<T> {
 struct HandshakeRecordReader<R: AsyncRead> {
     #[pin]
     reader: R,
-    state: HandshakeRecordReaderState,
+    currently_reading: HandshakeRecordReaderReading,
 }
 
 impl<R: AsyncRead> HandshakeRecordReader<R> {
     fn new(reader: R) -> HandshakeRecordReader<R> {
         HandshakeRecordReader {
-            reader: reader,
-            state: HandshakeRecordReaderState::ReadingContentType,
+            reader,
+            currently_reading: HandshakeRecordReaderReading::ContentType,
         }
     }
 }
 
-enum HandshakeRecordReaderState {
-    ReadingContentType,
-    ReadingMajorMinorVersion(usize),
-    ReadingRecordSize([u8; 2], usize),
-    ReadingRecord(usize),
+enum HandshakeRecordReaderReading {
+    ContentType,
+    MajorMinorVersion(usize),
+    RecordSize([u8; 2], usize),
+    Record(usize),
 }
 
 impl<R: AsyncRead> AsyncRead for HandshakeRecordReader<R> {
@@ -261,8 +261,8 @@ impl<R: AsyncRead> AsyncRead for HandshakeRecordReader<R> {
     ) -> Poll<Result<(), Error>> {
         let mut this = self.project();
         loop {
-            match this.state {
-                HandshakeRecordReaderState::ReadingContentType => {
+            match this.currently_reading {
+                HandshakeRecordReaderReading::ContentType => {
                     const CONTENT_TYPE_HANDSHAKE: u8 = 22;
                     let mut buf = [0];
                     let mut buf = ReadBuf::new(&mut buf[..]);
@@ -278,13 +278,14 @@ impl<R: AsyncRead> AsyncRead for HandshakeRecordReader<R> {
                                     ),
                                 )));
                             }
-                            *this.state = HandshakeRecordReaderState::ReadingMajorMinorVersion(0);
+                            *this.currently_reading =
+                                HandshakeRecordReaderReading::MajorMinorVersion(0);
                         }
                         rslt => return rslt,
                     }
                 }
 
-                HandshakeRecordReaderState::ReadingMajorMinorVersion(bytes_read) => {
+                HandshakeRecordReaderReading::MajorMinorVersion(bytes_read) => {
                     let mut buf = [0, 0];
                     let mut buf = ReadBuf::new(&mut buf[..]);
                     buf.advance(*bytes_read);
@@ -292,15 +293,15 @@ impl<R: AsyncRead> AsyncRead for HandshakeRecordReader<R> {
                         Poll::Ready(Ok(())) => {
                             *bytes_read = buf.filled().len();
                             if *bytes_read == 2 {
-                                *this.state =
-                                    HandshakeRecordReaderState::ReadingRecordSize([0, 0], 0);
+                                *this.currently_reading =
+                                    HandshakeRecordReaderReading::RecordSize([0, 0], 0);
                             }
                         }
                         rslt => return rslt,
                     }
                 }
 
-                HandshakeRecordReaderState::ReadingRecordSize(buf, bytes_read) => {
+                HandshakeRecordReaderReading::RecordSize(buf, bytes_read) => {
                     const MAX_RECORD_SIZE: usize = 1 << 14;
                     let mut buf = ReadBuf::new(&mut buf[..]);
                     buf.advance(*bytes_read);
@@ -319,14 +320,15 @@ impl<R: AsyncRead> AsyncRead for HandshakeRecordReader<R> {
                                         ),
                                     )));
                                 }
-                                *this.state = HandshakeRecordReaderState::ReadingRecord(record_size)
+                                *this.currently_reading =
+                                    HandshakeRecordReaderReading::Record(record_size)
                             }
                         }
                         rslt => return rslt,
                     }
                 }
 
-                HandshakeRecordReaderState::ReadingRecord(remaining_record_bytes) => {
+                HandshakeRecordReaderReading::Record(remaining_record_bytes) => {
                     // This is gross: we want to read into caller_buf, BUT calling `take` gives a
                     // ReadBuf that has the same underlying buffer but an independent filled
                     // cursor. So we have to call `advance` manually, BUT to avoid panics we also
@@ -350,7 +352,7 @@ impl<R: AsyncRead> AsyncRead for HandshakeRecordReader<R> {
                         caller_buf.advance(bytes_read);
                         *remaining_record_bytes -= bytes_read;
                         if *remaining_record_bytes == 0 {
-                            *this.state = HandshakeRecordReaderState::ReadingContentType;
+                            *this.currently_reading = HandshakeRecordReaderReading::ContentType;
                         }
                     }
                     return rslt;
