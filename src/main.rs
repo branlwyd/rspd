@@ -106,21 +106,20 @@ async fn handle_connection(
     .await??;
     let read_buf = recording_reader.buf();
 
-    // Determine server hostname & dial it.
-    let server_host = match cfg.host_mappings.get(&sni_hostname) {
-        Some(server_host) => server_host,
-        None => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unknown SNI hostname {}", sni_hostname),
-            ))
-        }
-    };
+    // Determine server hostname from SNI hostname.
+    let server_host = cfg.host_mappings.get(&sni_hostname).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unknown SNI hostname {}", sni_hostname),
+        )
+    })?;
     info!(
         "[{}] Sent SNI hostname {}, mapping to {}",
         client_addr, sni_hostname, server_host
     );
 
+    // Copy data bidirectionally between client & server, making sure to send the server anything we
+    // read from the client ourself first.
     let mut client_stream = PrefixedReaderWriter::new(client_stream, read_buf);
     let mut server_stream = TcpStream::connect((&server_host[..], 443)).await?;
     io::copy_bidirectional(&mut client_stream, &mut server_stream).await?;
@@ -446,19 +445,20 @@ async fn read_sni_host_name_from_client_hello<R: AsyncRead>(
             }
 
             let name_len = read_u16(reader.as_mut()).await?;
-            let mut name_buf = vec![0; name_len.into()];
-            reader.read_exact(&mut name_buf).await?;
-            return match String::from_utf8(name_buf) {
-                Ok(s) => Ok(s),
-                Err(err) => Err(io::Error::new(io::ErrorKind::InvalidData, err)),
-            };
+            let mut name = String::with_capacity(name_len.into());
+            return reader
+                .take(name_len.into())
+                .read_to_string(&mut name)
+                .await
+                .map(|_| name);
         }
     }
 }
 
 async fn skip<R: AsyncRead>(reader: Pin<&mut R>, len: u64) -> io::Result<()> {
-    io::copy(&mut reader.take(len), &mut io::sink()).await?;
-    Ok(())
+    io::copy(&mut reader.take(len), &mut io::sink())
+        .await
+        .map(|_| ())
 }
 
 async fn skip_vec_u8<R: AsyncRead>(mut reader: Pin<&mut R>) -> io::Result<()> {
@@ -473,18 +473,23 @@ async fn skip_vec_u16<R: AsyncRead>(mut reader: Pin<&mut R>) -> io::Result<()> {
 
 async fn read_u8<R: AsyncRead>(mut reader: Pin<&mut R>) -> io::Result<u8> {
     let mut buf = [0; 1];
-    reader.as_mut().read_exact(&mut buf).await?;
-    Ok(buf[0])
+    reader.as_mut().read_exact(&mut buf).await.map(|_| buf[0])
 }
 
 async fn read_u16<R: AsyncRead>(mut reader: Pin<&mut R>) -> io::Result<u16> {
     let mut buf = [0; 2];
-    reader.as_mut().read_exact(&mut buf).await?;
-    Ok(NetworkEndian::read_u16(&buf))
+    reader
+        .as_mut()
+        .read_exact(&mut buf)
+        .await
+        .map(|_| NetworkEndian::read_u16(&buf))
 }
 
 async fn read_u24<R: AsyncRead>(mut reader: Pin<&mut R>) -> io::Result<u32> {
     let mut buf = [0; 3];
-    reader.as_mut().read_exact(&mut buf).await?;
-    Ok(NetworkEndian::read_u24(&buf))
+    reader
+        .as_mut()
+        .read_exact(&mut buf)
+        .await
+        .map(|_| NetworkEndian::read_u24(&buf))
 }
