@@ -161,8 +161,7 @@ impl<R: AsyncRead> AsyncRead for RecordingBufReader<R> {
         if *this.read_offset == this.buf.len() {
             this.buf.reserve(RECORDING_READER_BUF_SIZE);
             let mut read_buf = ReadBuf::uninit(this.buf.spare_capacity_mut());
-            let rslt = this.reader.as_mut().poll_read(cx, &mut read_buf);
-            match rslt {
+            match this.reader.as_mut().poll_read(cx, &mut read_buf) {
                 Poll::Ready(Ok(())) => {
                     let bytes_read = read_buf.filled().len();
                     let new_len = this.buf.len() + bytes_read;
@@ -188,15 +187,15 @@ struct PrefixedReaderWriter<T: AsyncRead + AsyncWrite> {
     #[pin]
     inner: T,
     prefix: Vec<u8>,
-    read_prefix: usize,
+    prefix_read_offset: usize,
 }
 
-impl<'a, T: AsyncRead + AsyncWrite> PrefixedReaderWriter<T> {
+impl<T: AsyncRead + AsyncWrite> PrefixedReaderWriter<T> {
     fn new(inner: T, prefix: Vec<u8>) -> PrefixedReaderWriter<T> {
         PrefixedReaderWriter {
             inner,
             prefix,
-            read_prefix: 0,
+            prefix_read_offset: 0,
         }
     }
 }
@@ -212,13 +211,12 @@ impl<T: AsyncRead + AsyncWrite> AsyncRead for PrefixedReaderWriter<T> {
             return this.inner.poll_read(cx, buf);
         }
 
-        let read_prefix = *this.read_prefix;
-        let prefix = &this.prefix[read_prefix..];
-        let read_size = min(buf.remaining(), prefix.len());
-        buf.put_slice(&prefix[..read_size]);
-        *this.read_prefix += read_size;
+        let prefix = &this.prefix[*this.prefix_read_offset..];
+        let n = min(buf.remaining(), prefix.len());
+        buf.put_slice(&prefix[..n]);
+        *this.prefix_read_offset += n;
 
-        if *this.read_prefix == this.prefix.len() {
+        if *this.prefix_read_offset == this.prefix.len() {
             mem::take(this.prefix);
         }
 
