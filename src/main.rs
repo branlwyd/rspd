@@ -347,26 +347,21 @@ impl<R: AsyncRead> AsyncRead for HandshakeRecordReader<R> {
                 }
 
                 HandshakeRecordReaderReading::Record(remaining_record_bytes) => {
-                    // This is gross: we want to read into caller_buf, BUT calling `take` gives a
-                    // ReadBuf that has the same underlying buffer but an independent filled
-                    // cursor. So we have to call `advance` manually, BUT to avoid panics we also
-                    // have to call `initialize_unfilled_to` to ensure we don't advance into
-                    // uninitialized memory.
-                    //
-                    // This is a terribly-designed API. A better API would have caused `take` to
-                    // return a "view" that updated the "filled" cursor of the covered ReadBuf,
-                    // too, rather than requiring every single user of the API to figure out that
-                    // this is required and implement it every time they want a limited read.
+                    // We ultimately want to read record bytes into `caller_buf`, but we need to
+                    // ensure that we don't read more bytes than there are record bytes (and end
+                    // up handing the caller record header bytes). So we call `caller_buf.take()`.
+                    // Since `take` returns an independent `ReadBuf`, we have to update `caller_buf`
+                    // once we're done reading: first we call `assume_init` to assert that the
+                    // `bytes_read` bytes we read are initialized, then we call `advance` to assert
+                    // that the appropriate section of the buffer is filled.
 
-                    caller_buf.initialize_unfilled_to(min(
-                        caller_buf.remaining(),
-                        *remaining_record_bytes,
-                    ));
                     let mut buf = caller_buf.take(*remaining_record_bytes);
-                    let old_bytes_read = buf.filled().len();
                     let rslt = this.reader.as_mut().poll_read(cx, &mut buf);
                     if let Poll::Ready(Ok(())) = rslt {
-                        let bytes_read = buf.filled().len() - old_bytes_read;
+                        let bytes_read = buf.filled().len();
+                        unsafe {
+                            caller_buf.assume_init(bytes_read);
+                        }
                         caller_buf.advance(bytes_read);
                         *remaining_record_bytes -= bytes_read;
                         if *remaining_record_bytes == 0 {
