@@ -1,21 +1,9 @@
 #![feature(vec_spare_capacity)]
-extern crate byteorder;
-extern crate clap;
-#[macro_use]
-extern crate log;
-#[macro_use]
-extern crate pin_project;
-#[macro_use]
-extern crate pin_utils;
-extern crate serde;
-#[macro_use]
-extern crate serde_derive;
-extern crate serde_yaml;
-extern crate simple_logger;
-extern crate tokio;
 
 use byteorder::{ByteOrder, NetworkEndian};
-use log::Level;
+use log::{error, info, Level};
+use pin_project::pin_project;
+use serde_derive::Deserialize;
 use std::cmp::min;
 use std::collections::HashMap;
 use std::fs::File;
@@ -26,6 +14,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, Error, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::pin;
 use tokio::task;
 use tokio::time;
 
@@ -98,7 +87,7 @@ async fn handle_connection(
     // Read SNI hostname.
     let mut recording_reader = RecordingBufReader::new(&mut client_stream);
     let reader = HandshakeRecordReader::new(&mut recording_reader);
-    pin_mut!(reader);
+    pin!(reader);
     let sni_hostname = time::timeout(
         Duration::from_secs(5),
         read_sni_host_name_from_client_hello(reader),
@@ -393,7 +382,7 @@ async fn read_sni_host_name_from_client_hello<R: AsyncRead>(
     // Handshake message length.
     let len = read_u24(reader.as_mut()).await?;
     let reader = reader.take(len.into());
-    pin_mut!(reader);
+    pin!(reader);
 
     // ProtocolVersion (2 bytes) & random (32 bytes).
     skip(reader.as_mut(), 34).await?;
@@ -406,7 +395,7 @@ async fn read_sni_host_name_from_client_hello<R: AsyncRead>(
     // Extensions.
     let ext_len = reader.read_u16().await?;
     let reader = reader.take(ext_len.into());
-    pin_mut!(reader);
+    pin!(reader);
     loop {
         // Extension type & length.
         let ext_typ = reader.read_u16().await?;
@@ -418,12 +407,12 @@ async fn read_sni_host_name_from_client_hello<R: AsyncRead>(
             continue;
         }
         let reader = reader.take(ext_len.into());
-        pin_mut!(reader);
+        pin!(reader);
 
         // ServerNameList length.
         let snl_len = reader.read_u16().await?;
         let reader = reader.take(snl_len.into());
-        pin_mut!(reader);
+        pin!(reader);
 
         // ServerNameList.
         loop {
