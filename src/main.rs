@@ -319,16 +319,15 @@ impl<R: AsyncRead> AsyncRead for HandshakeRecordReader<R> {
                     }
                 }
 
-                HandshakeRecordReaderReading::RecordSize(buf, bytes_read) => {
+                HandshakeRecordReaderReading::RecordSize(backing_array, bytes_read) => {
                     const MAX_RECORD_SIZE: usize = 1 << 14;
-                    let mut buf = ReadBuf::new(&mut buf[..]);
+                    let mut buf = ReadBuf::new(&mut backing_array[..]);
                     buf.advance(*bytes_read);
                     match this.reader.as_mut().poll_read(cx, &mut buf) {
                         Poll::Ready(Ok(())) => {
                             *bytes_read = buf.filled().len();
                             if *bytes_read == 2 {
-                                let record_size: usize =
-                                    NetworkEndian::read_u16(buf.filled()).into();
+                                let record_size = u16::from_be_bytes(*backing_array).into();
                                 if record_size > MAX_RECORD_SIZE {
                                     return Poll::Ready(Err(io::Error::new(
                                         io::ErrorKind::InvalidData,
@@ -380,7 +379,7 @@ async fn read_sni_host_name_from_client_hello<R: AsyncRead>(
 ) -> io::Result<String> {
     // Handshake message type.
     const HANDSHAKE_TYPE_CLIENT_HELLO: u8 = 1;
-    let typ = read_u8(reader.as_mut()).await?;
+    let typ = reader.read_u8().await?;
     if typ != HANDSHAKE_TYPE_CLIENT_HELLO {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -405,13 +404,13 @@ async fn read_sni_host_name_from_client_hello<R: AsyncRead>(
     skip_vec_u8(reader.as_mut()).await?;
 
     // Extensions.
-    let ext_len = read_u16(reader.as_mut()).await?;
+    let ext_len = reader.read_u16().await?;
     let reader = reader.take(ext_len.into());
     pin_mut!(reader);
     loop {
         // Extension type & length.
-        let ext_typ = read_u16(reader.as_mut()).await?;
-        let ext_len = read_u16(reader.as_mut()).await?;
+        let ext_typ = reader.read_u16().await?;
+        let ext_len = reader.read_u16().await?;
 
         const EXTENSION_TYPE_SNI: u16 = 0;
         if ext_typ != EXTENSION_TYPE_SNI {
@@ -422,14 +421,14 @@ async fn read_sni_host_name_from_client_hello<R: AsyncRead>(
         pin_mut!(reader);
 
         // ServerNameList length.
-        let snl_len = read_u16(reader.as_mut()).await?;
+        let snl_len = reader.read_u16().await?;
         let reader = reader.take(snl_len.into());
         pin_mut!(reader);
 
         // ServerNameList.
         loop {
             // NameType & length.
-            let name_typ = read_u8(reader.as_mut()).await?;
+            let name_typ = reader.read_u8().await?;
 
             const NAME_TYPE_HOST_NAME: u8 = 0;
             if name_typ != NAME_TYPE_HOST_NAME {
@@ -437,13 +436,13 @@ async fn read_sni_host_name_from_client_hello<R: AsyncRead>(
                 continue;
             }
 
-            let name_len = read_u16(reader.as_mut()).await?;
+            let name_len = reader.read_u16().await?;
             let mut name = String::with_capacity(name_len.into());
-            return reader
+            reader
                 .take(name_len.into())
                 .read_to_string(&mut name)
-                .await
-                .map(|_| name);
+                .await?;
+            return Ok(name);
         }
     }
 }
@@ -455,27 +454,13 @@ async fn skip<R: AsyncRead>(reader: Pin<&mut R>, len: u64) -> io::Result<()> {
 }
 
 async fn skip_vec_u8<R: AsyncRead>(mut reader: Pin<&mut R>) -> io::Result<()> {
-    let sz = read_u8(reader.as_mut()).await?;
+    let sz = reader.read_u8().await?;
     skip(reader.as_mut(), sz.into()).await
 }
 
 async fn skip_vec_u16<R: AsyncRead>(mut reader: Pin<&mut R>) -> io::Result<()> {
-    let sz = read_u16(reader.as_mut()).await?;
+    let sz = reader.read_u16().await?;
     skip(reader.as_mut(), sz.into()).await
-}
-
-async fn read_u8<R: AsyncRead>(mut reader: Pin<&mut R>) -> io::Result<u8> {
-    let mut buf = [0; 1];
-    reader.as_mut().read_exact(&mut buf).await.map(|_| buf[0])
-}
-
-async fn read_u16<R: AsyncRead>(mut reader: Pin<&mut R>) -> io::Result<u16> {
-    let mut buf = [0; 2];
-    reader
-        .as_mut()
-        .read_exact(&mut buf)
-        .await
-        .map(|_| NetworkEndian::read_u16(&buf))
 }
 
 async fn read_u24<R: AsyncRead>(mut reader: Pin<&mut R>) -> io::Result<u32> {
