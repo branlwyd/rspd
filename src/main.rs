@@ -3,7 +3,7 @@
 use byteorder::{ByteOrder, NetworkEndian};
 use log::{error, info, Level};
 use pin_project::pin_project;
-use serde_derive::Deserialize;
+use serde::Deserialize;
 use std::cmp::min;
 use std::collections::HashMap;
 use std::fs::File;
