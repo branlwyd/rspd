@@ -7,6 +7,7 @@ use serde::Deserialize;
 use std::cmp::min;
 use std::collections::HashMap;
 use std::fs::File;
+use std::io::ErrorKind;
 use std::mem;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::pin::Pin;
@@ -426,12 +427,11 @@ async fn read_sni_host_name_from_client_hello<R: AsyncRead>(
             }
 
             let name_len = reader.read_u16().await?;
-            let mut name = String::with_capacity(name_len.into());
-            reader
-                .take(name_len.into())
-                .read_to_string(&mut name)
-                .await?;
-            return Ok(name);
+            let new_limit = min(reader.limit(), name_len.into());
+            reader.set_limit(new_limit);
+            let mut name_buf = vec![0; name_len.into()];
+            reader.read_exact(&mut name_buf).await?;
+            return String::from_utf8(name_buf).map_err(|err| io::Error::new(ErrorKind::InvalidData, err));
         }
     }
 }
