@@ -437,9 +437,11 @@ async fn read_sni_host_name_from_client_hello<R: AsyncRead>(
 }
 
 async fn skip<R: AsyncRead>(reader: Pin<&mut R>, len: u64) -> io::Result<()> {
-    io::copy(&mut reader.take(len), &mut io::sink())
-        .await
-        .map(|_| ())
+    let bytes_read = io::copy(&mut reader.take(len), &mut io::sink()).await?;
+    if bytes_read < len {
+        return Err(io::Error::new(ErrorKind::UnexpectedEof, format!("skip read {} < {} bytes", bytes_read, len)));
+    }
+    Ok(())
 }
 
 async fn skip_vec_u8<R: AsyncRead>(mut reader: Pin<&mut R>) -> io::Result<()> {
