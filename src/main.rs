@@ -394,8 +394,8 @@ async fn read_sni_host_name_from_client_hello<R: AsyncRead>(
 
     // Extensions.
     let ext_len = reader.read_u16().await?;
-    let reader = reader.take(ext_len.into());
-    pin!(reader);
+    let new_limit = min(reader.limit(), ext_len.into());
+    reader.set_limit(new_limit);
     loop {
         // Extension type & length.
         let ext_typ = reader.read_u16().await?;
@@ -406,13 +406,13 @@ async fn read_sni_host_name_from_client_hello<R: AsyncRead>(
             skip(reader.as_mut(), ext_len.into()).await?;
             continue;
         }
-        let reader = reader.take(ext_len.into());
-        pin!(reader);
+        let new_limit = min(reader.limit(), ext_len.into());
+        reader.set_limit(new_limit);
 
         // ServerNameList length.
         let snl_len = reader.read_u16().await?;
-        let reader = reader.take(snl_len.into());
-        pin!(reader);
+        let new_limit = min(reader.limit(), snl_len.into());
+        reader.set_limit(new_limit);
 
         // ServerNameList.
         loop {
