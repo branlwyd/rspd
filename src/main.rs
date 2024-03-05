@@ -1,24 +1,26 @@
-#![feature(vec_spare_capacity)]
-
 use byteorder::{ByteOrder, NetworkEndian};
 use log::{error, info, Level};
 use pin_project::pin_project;
 use serde::Deserialize;
-use std::cmp::min;
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::ErrorKind;
-use std::mem;
-use std::net::{Ipv4Addr, SocketAddr};
-use std::pin::Pin;
-use std::task::{Context, Poll};
-use std::time::Duration;
-use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, Error, ReadBuf};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::pin;
-use tokio::task;
-use tokio::time;
+use std::{
+    cmp::min,
+    collections::HashMap,
+    fs::File,
+    io::ErrorKind,
+    mem,
+    net::{Ipv4Addr, SocketAddr},
+    pin::Pin,
+    task::{Context, Poll},
+    time::Duration,
+};
+use tokio::{
+    io::{self, AsyncRead, AsyncReadExt, AsyncWrite, Error, ReadBuf},
+    net::{TcpListener, TcpStream},
+    pin, task, time,
+};
 
+// TODO: update clap from v2 -> v4
+// TODO: switch to using tracing for logging
 // TODO: re-implement HandshakeRecordReader in a saner way and nuke the existing implementation from orbit
 // TODO: implement read_u{8,16,24} as an extension trait on Read once async traits functions are supported
 
@@ -431,7 +433,8 @@ async fn read_sni_host_name_from_client_hello<R: AsyncRead>(
             reader.set_limit(new_limit);
             let mut name_buf = vec![0; name_len.into()];
             reader.read_exact(&mut name_buf).await?;
-            return String::from_utf8(name_buf).map_err(|err| io::Error::new(ErrorKind::InvalidData, err));
+            return String::from_utf8(name_buf)
+                .map_err(|err| io::Error::new(ErrorKind::InvalidData, err));
         }
     }
 }
@@ -439,7 +442,10 @@ async fn read_sni_host_name_from_client_hello<R: AsyncRead>(
 async fn skip<R: AsyncRead>(reader: Pin<&mut R>, len: u64) -> io::Result<()> {
     let bytes_read = io::copy(&mut reader.take(len), &mut io::sink()).await?;
     if bytes_read < len {
-        return Err(io::Error::new(ErrorKind::UnexpectedEof, format!("skip read {} < {} bytes", bytes_read, len)));
+        return Err(io::Error::new(
+            ErrorKind::UnexpectedEof,
+            format!("skip read {} < {} bytes", bytes_read, len),
+        ));
     }
     Ok(())
 }
