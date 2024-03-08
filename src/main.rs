@@ -1,6 +1,5 @@
 use byteorder::{ByteOrder, NetworkEndian};
 use clap::Parser;
-use log::{error, info, Level};
 use pin_project::pin_project;
 use serde::Deserialize;
 use std::{
@@ -10,7 +9,7 @@ use std::{
     fs::File,
     io::ErrorKind,
     mem,
-    net::{Ipv4Addr, SocketAddr},
+    net::Ipv4Addr,
     pin::Pin,
     task::{Context, Poll},
     time::Duration,
@@ -20,8 +19,8 @@ use tokio::{
     net::{TcpListener, TcpStream},
     pin, task, time,
 };
+use tracing::{error, info, info_span, Instrument};
 
-// TODO: switch to using tracing for logging
 // TODO: re-implement HandshakeRecordReader in a saner way and nuke the existing implementation from orbit
 // TODO: implement read_u{8,16,24} as an extension trait on Read once async traits functions are supported
 
@@ -36,7 +35,9 @@ struct Args {
 #[tokio::main]
 async fn main() {
     // Initialize, parse & verify flags.
-    simple_logger::init_with_level(Level::Info).expect("Couldn't initialize logging");
+    tracing_subscriber::fmt()
+        .event_format(tracing_subscriber::fmt::format().with_target(false))
+        .init();
     let args = Args::parse();
 
     // Read, parse, & verify config.
@@ -58,17 +59,20 @@ async fn main() {
     loop {
         match listener.accept().await {
             Ok((stream, client_addr)) => {
-                task::spawn(async move {
-                    info!("[{}] Accepted connection", client_addr);
-                    match handle_connection(cfg, client_addr, stream).await {
-                        Ok(_) => info!("[{}] Closed connection", client_addr),
-                        Err(err) => {
-                            error!("[{}] Closed connection with error: {}", client_addr, err)
+                task::spawn(
+                    async move {
+                        info!("Accepted connection");
+                        match handle_connection(cfg, stream).await {
+                            Ok(_) => info!("Closed connection"),
+                            Err(err) => {
+                                error!(%err, "Closed connection with error")
+                            }
                         }
                     }
-                });
+                    .instrument(info_span!("handle_connection", %client_addr)),
+                );
             }
-            Err(err) => error!("Couldn't accept connection: {}", err),
+            Err(err) => error!(%err, "Couldn't accept connection"),
         }
     }
 }
@@ -78,11 +82,7 @@ struct Config {
     host_mappings: HashMap<String, String>,
 }
 
-async fn handle_connection(
-    cfg: &Config,
-    client_addr: SocketAddr,
-    mut client_stream: TcpStream,
-) -> io::Result<()> {
+async fn handle_connection(cfg: &Config, mut client_stream: TcpStream) -> io::Result<()> {
     // Read SNI hostname.
     let mut recording_reader = RecordingBufReader::new(&mut client_stream);
     let reader = HandshakeRecordReader::new(&mut recording_reader);
@@ -98,12 +98,13 @@ async fn handle_connection(
     let server_host = cfg.host_mappings.get(&sni_hostname).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("unknown SNI hostname {}", sni_hostname),
+            format!("unknown SNI hostname: {}", sni_hostname),
         )
     })?;
     info!(
-        "[{}] Sent SNI hostname {}, mapping to {}",
-        client_addr, sni_hostname, server_host
+        %sni_hostname,
+        %server_host,
+        "Successfully mapped SNI hostname to host"
     );
 
     // Copy data bidirectionally between client & server, making sure to send the server anything we
