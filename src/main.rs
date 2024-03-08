@@ -1,10 +1,12 @@
 use byteorder::{ByteOrder, NetworkEndian};
+use clap::Parser;
 use log::{error, info, Level};
 use pin_project::pin_project;
 use serde::Deserialize;
 use std::{
     cmp::min,
     collections::HashMap,
+    ffi::OsString,
     fs::File,
     io::ErrorKind,
     mem,
@@ -19,33 +21,27 @@ use tokio::{
     pin, task, time,
 };
 
-// TODO: update clap from v2 -> v4
 // TODO: switch to using tracing for logging
 // TODO: re-implement HandshakeRecordReader in a saner way and nuke the existing implementation from orbit
 // TODO: implement read_u{8,16,24} as an extension trait on Read once async traits functions are supported
+
+/// Simple SNI-based HTTPS proxy.
+#[derive(Parser)]
+struct Args {
+    /// The config file to use.
+    #[arg(long, value_name = "FILE")]
+    config: OsString,
+}
 
 #[tokio::main]
 async fn main() {
     // Initialize, parse & verify flags.
     simple_logger::init_with_level(Level::Info).expect("Couldn't initialize logging");
-    let flags = clap::App::new("rspd")
-        .version(env!("CARGO_PKG_VERSION"))
-        .author("Brandon Pitman <bran@bran.land>")
-        .about("Simple SNI-based HTTPS proxy.")
-        .arg(
-            clap::Arg::with_name("config")
-                .long("config")
-                .value_name("FILE")
-                .help("The config file to use")
-                .required(true)
-                .takes_value(true),
-        )
-        .get_matches();
+    let args = Args::parse();
 
     // Read, parse, & verify config.
     let cfg: &'static Config = Box::leak(Box::new({
-        let config_filename = flags.value_of_os("config").unwrap();
-        let config_file = File::open(config_filename).expect("Couldn't open config file");
+        let config_file = File::open(args.config).expect("Couldn't open config file");
         serde_yaml::from_reader(config_file).expect("Couldn't parse config file")
     }));
 
