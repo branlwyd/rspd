@@ -19,8 +19,10 @@ use tokio::{
     net::{TcpListener, TcpStream},
     pin, task, time,
 };
-use tracing::{error, info, info_span, Instrument};
+use tracing::{Instrument, error, info, info_span};
 
+// TODO: switch from yaml to toml for config (serde_yaml crate is deprecated)
+// TODO: treat SNI hostnames as case-insensitive
 // TODO: re-implement HandshakeRecordReader in a saner way and nuke the existing implementation from orbit
 // TODO: implement read_u{8,16,24} as an extension trait on Read once async traits functions are supported
 
