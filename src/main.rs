@@ -118,7 +118,7 @@ async fn handle_connection(cfg: &Config, mut client_stream: TcpStream) -> io::Re
 }
 
 #[pin_project]
-struct RecordingBufReader<R: AsyncRead> {
+struct RecordingBufReader<R> {
     #[pin]
     reader: R,
     buf: Vec<u8>,
@@ -127,7 +127,7 @@ struct RecordingBufReader<R: AsyncRead> {
 
 const RECORDING_READER_BUF_SIZE: usize = 1 << 10; // 1 KiB
 
-impl<R: AsyncRead> RecordingBufReader<R> {
+impl<R> RecordingBufReader<R> {
     fn new(reader: R) -> RecordingBufReader<R> {
         RecordingBufReader {
             reader,
@@ -141,7 +141,10 @@ impl<R: AsyncRead> RecordingBufReader<R> {
     }
 }
 
-impl<R: AsyncRead> AsyncRead for RecordingBufReader<R> {
+impl<R> AsyncRead for RecordingBufReader<R>
+where
+    R: AsyncRead,
+{
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -174,14 +177,14 @@ impl<R: AsyncRead> AsyncRead for RecordingBufReader<R> {
 }
 
 #[pin_project]
-struct PrefixedReaderWriter<T: AsyncRead + AsyncWrite> {
+struct PrefixedReaderWriter<T> {
     #[pin]
     inner: T,
     prefix: Vec<u8>,
     prefix_read_offset: usize,
 }
 
-impl<T: AsyncRead + AsyncWrite> PrefixedReaderWriter<T> {
+impl<T> PrefixedReaderWriter<T> {
     fn new(inner: T, prefix: Vec<u8>) -> PrefixedReaderWriter<T> {
         PrefixedReaderWriter {
             inner,
@@ -191,7 +194,10 @@ impl<T: AsyncRead + AsyncWrite> PrefixedReaderWriter<T> {
     }
 }
 
-impl<T: AsyncRead + AsyncWrite> AsyncRead for PrefixedReaderWriter<T> {
+impl<T> AsyncRead for PrefixedReaderWriter<T>
+where
+    T: AsyncRead,
+{
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -215,7 +221,10 @@ impl<T: AsyncRead + AsyncWrite> AsyncRead for PrefixedReaderWriter<T> {
     }
 }
 
-impl<T: AsyncRead + AsyncWrite> AsyncWrite for PrefixedReaderWriter<T> {
+impl<T> AsyncWrite for PrefixedReaderWriter<T>
+where
+    T: AsyncWrite,
+{
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -240,13 +249,16 @@ impl<T: AsyncRead + AsyncWrite> AsyncWrite for PrefixedReaderWriter<T> {
 }
 
 #[pin_project]
-struct HandshakeRecordReader<R: AsyncRead> {
+struct HandshakeRecordReader<R> {
     #[pin]
     reader: R,
     currently_reading: HandshakeRecordReaderReading,
 }
 
-impl<R: AsyncRead> HandshakeRecordReader<R> {
+impl<R> HandshakeRecordReader<R>
+where
+    R: AsyncRead,
+{
     fn new(reader: R) -> HandshakeRecordReader<R> {
         HandshakeRecordReader {
             reader,
@@ -262,7 +274,10 @@ enum HandshakeRecordReaderReading {
     Record(usize),
 }
 
-impl<R: AsyncRead> AsyncRead for HandshakeRecordReader<R> {
+impl<R> AsyncRead for HandshakeRecordReader<R>
+where
+    R: AsyncRead,
+{
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -365,9 +380,10 @@ impl<R: AsyncRead> AsyncRead for HandshakeRecordReader<R> {
     }
 }
 
-async fn read_sni_host_name_from_client_hello<R: AsyncRead>(
-    mut reader: Pin<&mut R>,
-) -> io::Result<String> {
+async fn read_sni_host_name_from_client_hello<R>(mut reader: Pin<&mut R>) -> io::Result<String>
+where
+    R: AsyncRead,
+{
     // Handshake message type.
     const HANDSHAKE_TYPE_CLIENT_HELLO: u8 = 1;
     let typ = reader.read_u8().await?;
@@ -438,7 +454,10 @@ async fn read_sni_host_name_from_client_hello<R: AsyncRead>(
     }
 }
 
-async fn skip<R: AsyncRead>(reader: Pin<&mut R>, len: u64) -> io::Result<()> {
+async fn skip<R>(reader: Pin<&mut R>, len: u64) -> io::Result<()>
+where
+    R: AsyncRead,
+{
     let bytes_read = io::copy(&mut reader.take(len), &mut io::sink()).await?;
     if bytes_read < len {
         return Err(io::Error::new(
@@ -449,17 +468,26 @@ async fn skip<R: AsyncRead>(reader: Pin<&mut R>, len: u64) -> io::Result<()> {
     Ok(())
 }
 
-async fn skip_vec_u8<R: AsyncRead>(mut reader: Pin<&mut R>) -> io::Result<()> {
+async fn skip_vec_u8<R>(mut reader: Pin<&mut R>) -> io::Result<()>
+where
+    R: AsyncRead,
+{
     let sz = reader.read_u8().await?;
     skip(reader.as_mut(), sz.into()).await
 }
 
-async fn skip_vec_u16<R: AsyncRead>(mut reader: Pin<&mut R>) -> io::Result<()> {
+async fn skip_vec_u16<R>(mut reader: Pin<&mut R>) -> io::Result<()>
+where
+    R: AsyncRead,
+{
     let sz = reader.read_u16().await?;
     skip(reader.as_mut(), sz.into()).await
 }
 
-async fn read_u24<R: AsyncRead>(mut reader: Pin<&mut R>) -> io::Result<u32> {
+async fn read_u24<R>(mut reader: Pin<&mut R>) -> io::Result<u32>
+where
+    R: AsyncRead,
+{
     let mut buf = [0; 3];
     reader
         .as_mut()
