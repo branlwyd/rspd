@@ -6,7 +6,7 @@ use std::{
     cmp::min,
     collections::HashMap,
     ffi::OsString,
-    fs::File,
+    fs::{self},
     io::ErrorKind,
     mem,
     net::Ipv4Addr,
@@ -44,8 +44,8 @@ async fn main() {
 
     // Read, parse, & verify config.
     let cfg: &'static Config = Box::leak(Box::new({
-        let config_file = File::open(args.config).expect("Couldn't open config file");
-        serde_yaml::from_reader(config_file).expect("Couldn't parse config file")
+        let config_string = fs::read_to_string(args.config).expect("Couldn't read config file");
+        toml::from_str(&config_string).expect("Couldn't parse config file")
     }));
 
     // Main loop: accept & handle connections.
